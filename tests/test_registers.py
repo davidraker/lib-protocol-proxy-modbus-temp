@@ -2,7 +2,8 @@
 import pytest
 
 from protocol_proxy.protocol.modbus.registers import (DATATYPE, MAX_READ, PAD, QueryBlock, ReadBlock, RegisterMap,
-                                                      RegisterSpec, parse_data_type, plan_ranges)
+                                                      RegisterSpec, parse_data_type, parse_type_spec, plan_ranges,
+                                                      swap_bytes)
 
 
 @pytest.mark.parametrize('type_string, expected', [
@@ -30,9 +31,36 @@ def test_parse_data_type_rejects_unknown(bad):
         parse_data_type(bad)
 
 
-def test_parse_data_type_ignores_byte_order_prefix(caplog):
-    assert parse_data_type('<f') == (DATATYPE.FLOAT32, None)
-    assert 'Ignoring byte order prefix' in caplog.text
+@pytest.mark.parametrize('type_string, little', [('>f', False), ('!H', False), ('f', False), ('<f', True), ('<H', True),
+                                                  ('=i', True), ('@q', True), ('uint16', False)])
+def test_parse_type_spec_byte_order(type_string, little):
+    assert parse_type_spec(type_string)[2] is little
+    assert parse_data_type(type_string) == parse_type_spec(type_string)[:2]
+
+
+class TestLittleEndianTypes:
+    """'<' types read the register byte stream little-endian, as the legacy pymodbus driver did with struct."""
+
+    def test_spec_defaults(self):
+        spec = RegisterSpec(0, '<f')
+        assert spec.byte_swap is True and spec.word_order == 'little' and spec.count == 2
+        assert RegisterSpec(0, '<f', word_order='big').word_order == 'big'        # explicit word order wins
+        assert RegisterSpec(0, '>f').byte_swap is False
+
+    @pytest.mark.parametrize('fmt, value', [('<H', 2 ** 16 - 1), ('<h', -(2 ** 16) // 2), ('<I', 2 ** 32 - 1),
+                                            ('<i', (2 ** 32) // 2 - 1), ('<f', -1234.0), ('<Q', 2 ** 64 - 1),
+                                            ('<q', -(2 ** 64) // 2), ('<d', 3.5)])
+    def test_matches_struct_semantics(self, fmt, value):
+        import struct
+        spec = RegisterSpec(0, fmt)
+        # A device holding this value would present registers whose big-endian byte stream is struct.pack(fmt).
+        stream = struct.pack(fmt, value)
+        registers = [int.from_bytes(stream[i:i + 2], 'big') for i in range(0, len(stream), 2)]
+        assert spec.decode(registers, bit_table=False) == value
+        assert spec.encode(value, bit_table=False) == registers
+
+    def test_swap_bytes(self):
+        assert swap_bytes([0x1234, 0x00ff]) == [0x3412, 0xff00]
 
 
 class TestRegisterSpec:

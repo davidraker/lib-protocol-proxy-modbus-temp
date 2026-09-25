@@ -67,52 +67,77 @@ _TYPE_PATTERN = re.compile(r'^\s*([<>=!@]?)\s*(\d*)\s*([A-Za-z?_][A-Za-z0-9_]*)\
 
 
 def parse_data_type(type_string: str) -> tuple[RegisterDataType, int | None]:
-    """Parse a data type string into a (data_type, register_count) pair.
+    """Parse a data type string into a (data_type, register_count) pair. See parse_type_spec for the byte order."""
+    data_type, count, _ = parse_type_spec(type_string)
+    return data_type, count
+
+
+def parse_type_spec(type_string: str) -> tuple[RegisterDataType, int | None, bool]:
+    """Parse a data type string into (data_type, register_count, little_endian).
 
     Accepts pymodbus DATATYPE names (``'UINT16'``), modbus_tk names (``'float'``, ``'string[8]'``, ``'pad[2]'``)
-    and struct format strings (``'>f'``, ``'8s'``, ``'4H'``, ``'2x'``). The returned count is in registers (or
-    bits, for coil tables) and is None when the string does not specify a length.
+    and struct format strings (``'>f'``, ``'<H'``, ``'8s'``, ``'4H'``, ``'2x'``). The returned count is in registers
+    (or bits, for coil tables) and is None when the string does not specify a length.
+
+    A ``<`` prefix (or the native-order prefixes ``=`` and ``@``, which mean little-endian on the machines VOLTTRON
+    runs on) requests the legacy interpretation of the pymodbus-based driver: the value is the little-endian reading of
+    the register byte stream, i.e. the registers are taken in reverse order with the bytes of each swapped.
     """
     match = _TYPE_PATTERN.match(type_string)
     if not match:
         raise ValueError(f"Unrecognized Modbus data type: {type_string!r}")
     byte_order, repeat, name, length = match.groups()
-    if byte_order in ('<', '=', '@'):
-        # Modbus registers are always big-endian within a word. Word order is a separate setting on RegisterSpec.
-        _log.warning(f"Ignoring byte order prefix {byte_order!r} in data type {type_string!r}."
-                     " Use word_order='little' for word-swapped values.")
+    little_endian = byte_order in ('<', '=', '@')
     if repeat and length:
         raise ValueError(f"Data type {type_string!r} may not have both a struct repeat count and a [length].")
     if name in _STRUCT_CODES and (repeat or len(name) == 1 and name not in _TYPE_NAMES):
         data_type = _STRUCT_CODES[name]
         if not repeat:
-            return data_type, None
+            return data_type, None, little_endian
         n = int(repeat)
         if name in _BYTE_COUNTED_CODES:
-            return data_type, (n + 1) // 2
-        return data_type, n * (data_type.value[1] or 1)
+            return data_type, (n + 1) // 2, little_endian
+        return data_type, n * (data_type.value[1] or 1), little_endian
     key = name.lower()
     if key not in _TYPE_NAMES:
         raise ValueError(f"Unrecognized Modbus data type: {type_string!r}")
     data_type = _TYPE_NAMES[key]
     if length is None:
-        return data_type, None
+        return data_type, None, little_endian
     n = int(length)
     if data_type is DATATYPE.STRING:
-        return data_type, (n + 1) // 2          # length is in characters
-    return data_type, n * (data_type.value[1] or 1)  # length is in elements (registers for PAD/BITS)
+        return data_type, (n + 1) // 2, little_endian          # length is in characters
+    return data_type, n * (data_type.value[1] or 1), little_endian  # length in elements (registers for PAD/BITS)
+
+
+def swap_bytes(registers: Sequence[int]) -> list[int]:
+    """Swap the two bytes of every 16-bit register."""
+    return [((r & 0xff) << 8) | ((r >> 8) & 0xff) for r in registers]
 
 
 class RegisterSpec:
     """The data type and extent of one point (or pad) starting at a Modbus address."""
-    __slots__ = ('address', 'data_type', 'count', 'word_order', 'string_encoding')
+    __slots__ = ('address', 'data_type', 'count', 'word_order', 'string_encoding', 'byte_swap')
 
     def __init__(self, address: int, data_type: RegisterDataType | str, count: int | None = None,
-                 word_order: WordOrder = 'big', string_encoding: str = 'utf-8'):
+                 word_order: WordOrder | None = None, string_encoding: str = 'utf-8', byte_swap: bool = False):
+        """
+        :param word_order: order of the registers making up a multi-register value. Defaults to 'big', or to
+            'little' when data_type is a '<'-prefixed struct format.
+        :param byte_swap: swap the two bytes of every register before decoding (after encoding). Set automatically
+            for '<'-prefixed struct formats; together with word_order='little' this reads the register byte stream
+            little-endian, as the legacy pymodbus driver did.
+        """
         if isinstance(data_type, str):
-            data_type, parsed_count = parse_data_type(data_type)
+            data_type, parsed_count, little_endian = parse_type_spec(data_type)
             if count is None:
                 count = parsed_count
+            if little_endian:
+                byte_swap = True
+                if word_order is None:
+                    word_order = 'little'
+        if word_order is None:
+            word_order = 'big'
         if not isinstance(data_type, (DATATYPE, PadType)):
             raise TypeError(f"data_type must be a pymodbus DATATYPE or PAD, not {type(data_type).__name__}")
         size = data_type.value[1]
@@ -131,6 +156,7 @@ class RegisterSpec:
         self.count = count
         self.word_order = word_order
         self.string_encoding = string_encoding
+        self.byte_swap = bool(byte_swap)
 
     @property
     def is_pad(self) -> bool:
@@ -153,6 +179,8 @@ class RegisterSpec:
                 raise ValueError(f"Coil tables only hold BITS, not {self.data_type.name} (address {self.address})")
             bits = [bool(b) for b in raw]
             return bits[0] if self.count == 1 else bits
+        if self.byte_swap:
+            raw = swap_bytes(raw)
         return ModbusClientMixin.convert_from_registers(raw, self.data_type, self.word_order, self.string_encoding)
 
     def encode(self, value: Any, bit_table: bool) -> list[int] | list[bool]:
@@ -182,7 +210,7 @@ class RegisterSpec:
         if len(registers) != self.count:
             raise ValueError(f"Value {value!r} encodes to {len(registers)} registers,"
                              f" but address {self.address} holds {self.count}")
-        return registers
+        return swap_bytes(registers) if self.byte_swap else registers
 
     def _coerce(self, value: Any, bit_table: bool) -> Any:
         if isinstance(value, (list, tuple)):
@@ -202,7 +230,7 @@ class RegisterSpec:
 
     def __repr__(self) -> str:
         return (f"RegisterSpec({self.address}, {self.data_type.name}, count={self.count},"
-                f" word_order={self.word_order!r})")
+                f" word_order={self.word_order!r}{', byte_swap=True' if self.byte_swap else ''})")
 
 
 class ReadBlock(NamedTuple):

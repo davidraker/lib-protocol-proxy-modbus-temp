@@ -143,12 +143,47 @@ class TestRawRead:
         run(client.read([(1001, 1)]))
         assert device.connections == 2
 
-    def test_connection_failure_is_raised(self, client, device):
+    def test_connection_failure_is_reported_per_query(self, client, device):
         device.connectable = False
-        from pymodbus.exceptions import ConnectionException
-        with pytest.raises(ConnectionException, match='Unable to connect'):
-            run(client.read([(1001, 1)]))
-        assert device.calls == []
+        result = run(client.read([(1001, 1), (1010, 1)]))
+        assert result['results'] == [None, None]
+        assert all('Unable to connect' in e for e in result['errors'])
+        assert device.calls == [] and device.connections == 2      # one attempt per request, none reach the device
+        result = run(client.write([(1010, None, [1])]))
+        assert 'Unable to connect' in result['errors'][0]
+
+    def test_half_open_connection_is_dropped_and_reopened_on_next_request(self, client, device):
+        run(client.read([(1001, 1)]))
+        device.stale = True                                   # device restarted; our socket is half-open
+        failed = run(client.read([(1001, 1)]))
+        assert failed['results'] == [None] and 'No response' in failed['errors'][0]
+        assert device.closed == 1 and not device.connected    # connection dropped, not retried now
+        recovered = run(client.read([(1001, 1)]))
+        assert recovered == {'results': [[0x3f80]], 'errors': [None]}
+        assert device.connections == 2 and len(device.requests()) == 3
+
+    def test_later_blocks_in_the_same_poll_recover(self, client, device):
+        run(client.read([(1001, 1)]))
+        device.stale = True
+        result = run(client.read([(1001, 1), (1010, 1)]))       # two requests: first fails, second reconnects
+        assert result == {'results': [None, [42]], 'errors': [result['errors'][0], None]}
+        assert device.connections == 2
+
+    def test_unreachable_device_is_not_retried(self, client, device):
+        run(client.read([(1001, 1)]))
+        device.stale = True
+        device.connectable = False                            # nobody answers a new connection either
+        failed = run(client.read([(1001, 1)]))
+        assert 'No response' in failed['errors'][0] and len(device.requests()) == 2
+        again = run(client.read([(1001, 1)]))
+        assert 'Unable to connect' in again['errors'][0] and len(device.requests()) == 2   # no request without a link
+
+    def test_write_failure_drops_connection_too(self, client, device):
+        run(client.read([(1001, 1)]))
+        device.stale = True
+        failed = run(client.write([(1010, None, [5])]))
+        assert failed['results'] == [None] and device.closed == 1
+        assert run(client.write([(1010, None, [5])]))['errors'] == [None] and device.registers[1010] == 5
 
     def test_concurrent_calls_are_serialized(self, client, device):
         order = []

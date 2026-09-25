@@ -49,10 +49,13 @@ class FakeDevice:
         self.connected = False
         self.connectable = True
         self.closed = 0
+        self.stale = False              # half-open: requests get no answer until the client reconnects
 
     async def connect(self) -> bool:
         self.connections += 1
         self.connected = self.connectable
+        if self.connected:
+            self.stale = False
         return self.connected
 
     def close(self):
@@ -66,6 +69,8 @@ class FakeDevice:
             bound = inspect.signature(real).bind(self, *args, **kwargs).arguments
             bound.pop('self')
             self.calls.append((name, bound))
+            if self.stale:
+                raise ModbusIOException('No response received after 3 retries')
             if self.delay:
                 self.events.append(('start', id(self), bound.get('address')))
                 await asyncio.sleep(self.delay)

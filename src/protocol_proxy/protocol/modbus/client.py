@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Coroutine, Iterable, Mapping
 
 from pymodbus import ModbusException
-from pymodbus.exceptions import ConnectionException
+from pymodbus.exceptions import ConnectionException, ModbusIOException
 from pymodbus.client import AsyncModbusSerialClient, AsyncModbusTcpClient, AsyncModbusTlsClient, AsyncModbusUdpClient
 from pymodbus.framer import FramerType
 from pymodbus.pdu import ModbusPDU
@@ -50,17 +50,18 @@ class ModbusClient:
 
     @asynccontextmanager
     async def _connection(self):
-        """Serialize access to the device and make sure it is connected.
+        """Serialize access to the device for one operation. Each request connects as needed (see _execute).
 
-        The connection is kept open between requests; pymodbus reconnects on its own if it drops. (Using the
-        pymodbus client as a context manager instead would close the connection at the end of every request,
-        which cancels any request another task has in flight.)
+        The connection is kept open between requests. (Using the pymodbus client as a context manager instead would
+        close the connection at the end of every request, which cancels any request another task has in flight.)
         """
         async with self._lock:
-            if not self.client.connected:
-                if not await self.client.connect():
-                    raise ConnectionException(f"Unable to connect to Modbus device {self.device_address}")
             yield self.client
+
+    async def _ensure_connected(self):
+        if not self.client.connected and not await self.client.connect():
+            raise ConnectionException(f"Unable to connect to Modbus device {self.device_address}")
+
 
     def close(self):
         """Close the connection to the device."""
@@ -404,20 +405,36 @@ class ModbusClient:
             raise ValueError(f"Count {count} does not match configured count {spec.count} for {spec!r}")
         return spec.encode(value, bit_table)
 
-    @staticmethod
-    async def _execute(make_request) -> tuple[ModbusPDU | None, Any]:
-        """Build and await one request, returning (response, None) on success or (None, error) otherwise."""
+    async def _execute(self, make_request) -> tuple[ModbusPDU | None, Any]:
+        """Build and await one request, returning (response, None) on success or (None, error) otherwise.
+
+        A transport failure (no response, connection lost) may mean the connection is half-open: a device or gateway
+        that restarted without resetting the TCP connection leaves pymodbus believing it is still connected, and every
+        later request would fail the same way. So on such a failure the connection is dropped; the next request opens
+        a new one. The failed request is not retried here: a unit that is merely silent behind a healthy gateway would
+        otherwise cost two full timeout-and-retry cycles on the shared bus instead of one.
+        """
         try:
-            response = await make_request()
-            if response.isError():
-                return None, response
-            return response, None
+            await self._ensure_connected()
+            return await self._attempt(make_request)
+        except (ModbusIOException, ConnectionException) as e:
+            _log.debug(f"Request to {self.device_address} failed ({e}); dropping the connection so the next request"
+                       " reconnects.")
+            self.client.close()
+            return None, f"Error in Modbus Client: {e}"
         except ModbusException as e:
             return None, f"Error in Modbus Client: {e}"
         except ValueError as e:
             return None, f"Error formulating Modbus query: {e}"
         except Exception as e:
             return None, f"Unexpected error while communicating with Modbus device: {e}"
+
+    @staticmethod
+    async def _attempt(make_request) -> tuple[ModbusPDU | None, Any]:
+        response = await make_request()
+        if response.isError():
+            return None, response
+        return response, None
 
     @staticmethod
     def _select_kwargs(register_map: str, allowed: frozenset[str], kwargs: dict[str, Any]) -> dict[str, Any]:
